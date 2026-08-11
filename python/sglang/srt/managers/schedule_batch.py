@@ -887,6 +887,12 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv: Optional[ReqKvInfo] = None
+        # CAR-DFLASH deferred prompt seeding writes draft KV after the exact
+        # token is ready.  Any CPU-side cache publication, offload, or location
+        # release must drain this event first.  It is per-request even though a
+        # batch normally shares one seed event, so all generic release paths are
+        # safe without depending on a transient GenerationBatchResult.
+        self.dflash_pending_seed_event = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1712,6 +1718,7 @@ class Req(ReqDllmMixin):
             self.output_ids = array("q")
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        self.drain_pending_dflash_seed()
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
@@ -1719,6 +1726,23 @@ class Req(ReqDllmMixin):
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
+
+    def drain_pending_dflash_seed(self) -> None:
+        """Wait for and clear an experimental deferred draft-KV write."""
+        event = self.dflash_pending_seed_event
+        if event is None:
+            return
+        # query avoids entering synchronize when the common case has already
+        # completed behind the forward-stream barrier.
+        if not event.query():
+            event.synchronize()
+        if self.dflash_pending_seed_event is event:
+            self.dflash_pending_seed_event = None
+
+    def clear_pending_dflash_seed(self, event) -> None:
+        """Clear ``event`` after a caller has already synchronized it."""
+        if self.dflash_pending_seed_event is event:
+            self.dflash_pending_seed_event = None
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[

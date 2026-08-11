@@ -2091,6 +2091,27 @@ class ServerArgs:
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
         NS("spec"),
     ] = None
+    speculative_dflash_seed_mode: A[
+        Literal["eager", "profile", "deferred-serial", "deferred-overlap"],
+        Arg(
+            help=(
+                "DFLASH prompt-seed experiment. 'eager' preserves the production "
+                "path; 'profile' adds asynchronous CUDA phase events; "
+                "'deferred-serial' copies/streams the exact first token before "
+                "draft-KV seeding while keeping later model work and cache reuse "
+                "strictly seed-gated; 'deferred-overlap' additionally lets an "
+                "unrelated overlap-scheduled batch run while the seed is pending, "
+                "but waits before any batch containing the seed-owning request."
+            ),
+            choices=["eager", "profile", "deferred-serial", "deferred-overlap"],
+        ),
+        NS("spec"),
+    ] = "eager"
+    speculative_dflash_profile_every_n: A[
+        int,
+        "DFLASH seed profiling: emit one structured batch metric every N prefill batches.",
+        NS("spec"),
+    ] = 1
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

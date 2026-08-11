@@ -167,6 +167,49 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
 
+    valid_seed_modes = {"eager", "profile", "deferred-serial", "deferred-overlap"}
+    if server_args.speculative_dflash_seed_mode not in valid_seed_modes:
+        raise ValueError(
+            "--speculative-dflash-seed-mode must be one of "
+            f"{sorted(valid_seed_modes)}, got "
+            f"{server_args.speculative_dflash_seed_mode!r}."
+        )
+    if int(server_args.speculative_dflash_profile_every_n) <= 0:
+        raise ValueError(
+            "--speculative-dflash-profile-every-n must be positive, got "
+            f"{server_args.speculative_dflash_profile_every_n}."
+        )
+
+    if server_args.speculative_dflash_seed_mode == "deferred-overlap":
+        # This mode relies on the ordinary overlap loop's one-result pipeline:
+        # launch an independent batch, then drain/publish the previous seed.
+        # The excluded paths either bypass that result processor or have cache
+        # relocation/batch mixing semantics not covered by the request-owned
+        # seed readiness state.
+        if not server_args.device.startswith("cuda"):
+            raise ValueError(
+                "DFLASH deferred-overlap requires CUDA/HIP stream semantics."
+            )
+        if resolved_view(server_args).disable_overlap_schedule:
+            raise ValueError(
+                "DFLASH deferred-overlap requires overlap scheduling; remove "
+                "--disable-overlap-schedule."
+            )
+        if server_args.enable_unified_memory:
+            raise ValueError(
+                "DFLASH deferred-overlap does not support unified memory because "
+                "async pool compaction is not yet gated by draft-seed readiness."
+            )
+        if server_args.disaggregation_mode != "null":
+            raise ValueError(
+                "DFLASH deferred-overlap does not support PD disaggregation."
+            )
+        if server_args.enable_mixed_chunk:
+            raise ValueError(
+                "DFLASH deferred-overlap does not support mixed prefill/decode "
+                "batches; disable --enable-mixed-chunk."
+            )
+
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
     # RoPE reservation). Force them to 1 to avoid surprising memory behavior.

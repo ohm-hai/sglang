@@ -54,6 +54,7 @@ def free_swa_out_of_window_slots(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
 ) -> None:
+    req.drain_pending_dflash_seed()
     if req.kv is None:
         return
 
@@ -96,6 +97,7 @@ def free_swa_out_of_window_slots(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+    req.drain_pending_dflash_seed()
     if getattr(req, "skip_radix_cache_insert", False):
         return
 
@@ -130,6 +132,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    req.drain_pending_dflash_seed()
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache

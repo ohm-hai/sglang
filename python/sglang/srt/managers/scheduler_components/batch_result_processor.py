@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -196,6 +197,15 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        # Only deferred modes have an early egress event.  Their seed event
+        # gates every radix publication and location release below.  Profile
+        # mode has events too, but retains the original eager mutation ordering.
+        dflash_seed_gate = (
+            getattr(result, "dflash_seed_ready_event", None)
+            if getattr(result, "dflash_egress_ready_event", None) is not None
+            else None
+        )
+        deferred_cache_actions: List[Tuple[str, Req]] = []
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -274,12 +284,26 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
+                        if dflash_seed_gate is not None:
+                            # max_new_tokens=1, EOS, and abort-at-prefill all
+                            # reach this branch.  Do not recycle a location while
+                            # the side stream may still be writing draft KV to it.
+                            deferred_cache_actions.append(("release", req))
+                        else:
+                            release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
-                        if get_memory().enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                        if dflash_seed_gate is not None:
+                            # Keep the request-owned locations private until the
+                            # draft side is valid.  This also prevents radix
+                            # canonicalization from freeing duplicate slots.
+                            deferred_cache_actions.append(("cache", req))
+                        else:
+                            maybe_cache_unfinished_req(req, self.tree_cache)
+                            if get_memory().enable_hisparse:
+                                self.hisparse_coordinator.admit_request_into_staging(
+                                    req
+                                )
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -367,12 +391,93 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, skip_stream_req
         )
 
+        if dflash_seed_gate is not None:
+            # The exact token has already been appended to Req and handed to the
+            # tokenizer IPC.  Waiting here makes the prototype safe but may move
+            # seed time into first-ITL; the benchmark reports both TTFT and ITL.
+            dflash_seed_gate.synchronize()
+            for req in batch.reqs:
+                req.clear_pending_dflash_seed(dflash_seed_gate)
+            if deferred_cache_actions:
+                self.token_to_kv_pool_allocator.free_group_begin()
+                for action, req in deferred_cache_actions:
+                    if action == "release":
+                        release_kv_cache(req, self.tree_cache)
+                    else:
+                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        if get_memory().enable_hisparse:
+                            self.hisparse_coordinator.admit_request_into_staging(req)
+                self.token_to_kv_pool_allocator.free_group_end()
+
+        if getattr(result, "dflash_profile_metadata", None) is not None:
+            self._report_dflash_car_profile(result)
+
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
+        )
+
+    def _report_dflash_car_profile(self, result: GenerationBatchResult) -> None:
+        """Emit one machine-readable, batch-level DFlash seed phase record.
+
+        The caller has already waited either copy_done (eager/profile, whose
+        copy depends on the whole forward stream) or dflash_seed_ready_event
+        (a deferred mode).  elapsed_time therefore cannot add a hidden device
+        synchronization to the serving hot path.
+        """
+        metadata = result.dflash_profile_metadata
+        if metadata is None:
+            return
+
+        def elapsed_ms(start, end):
+            if start is None or end is None:
+                return None
+            try:
+                return float(start.elapsed_time(end))
+            except Exception as exc:
+                logger.warning("DFLASH CAR event timing failed: %s", exc)
+                return None
+
+        payload = dict(metadata)
+        payload.update(
+            {
+                "mode": result.dflash_car_mode,
+                "target_to_token_ms": elapsed_ms(
+                    result.dflash_target_start_event,
+                    result.dflash_token_ready_event,
+                ),
+                "post_token_seed_ms": elapsed_ms(
+                    result.dflash_token_ready_event,
+                    result.dflash_seed_ready_event,
+                ),
+                "seed_input_snapshot_ms": elapsed_ms(
+                    result.dflash_token_ready_event,
+                    result.dflash_seed_input_ready_event,
+                ),
+                "seed_kernel_ms": elapsed_ms(
+                    result.dflash_seed_start_event,
+                    result.dflash_seed_ready_event,
+                ),
+                "hidden_project_ms": elapsed_ms(
+                    result.dflash_projection_start_event,
+                    result.dflash_projection_ready_event,
+                ),
+                "draft_kv_write_ms": elapsed_ms(
+                    result.dflash_projection_ready_event,
+                    result.dflash_seed_ready_event,
+                ),
+                "target_plus_seed_ms": elapsed_ms(
+                    result.dflash_target_start_event,
+                    result.dflash_seed_ready_event,
+                ),
+            }
+        )
+        logger.info(
+            "DFLASH_CAR_METRIC %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:

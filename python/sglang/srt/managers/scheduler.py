@@ -3608,6 +3608,27 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _wait_pending_dflash_seeds_for_batch(self, batch: ScheduleBatch) -> None:
+        """Order this batch after only the draft seeds its requests own.
+
+        deferred-overlap leaves the main forward stream free after target
+        prefill so an unrelated waiting prefill can overtake prompt draft-KV
+        construction.  A request cannot itself enter target/draft execution
+        until its seed is valid.  Events are shared by requests from the same
+        prefill batch, so deduplicate them without clearing request ownership;
+        result processing owns publication and clearing.
+
+        This is called only from the overlap forward-stream context and only
+        for the explicitly validated deferred-overlap mode.
+        """
+        seen_event_ids = set()
+        for req in batch.reqs:
+            event = req.dflash_pending_seed_event
+            if event is None or id(event) in seen_event_ids:
+                continue
+            self.forward_stream.wait_event(event)
+            seen_event_ids.add(id(event))
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -3650,6 +3671,11 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    if (
+                        self.server_args.speculative_dflash_seed_mode
+                        == "deferred-overlap"
+                    ):
+                        self._wait_pending_dflash_seeds_for_batch(batch)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
@@ -3680,6 +3706,14 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if batch_result.dflash_seed_input_ready_event is not None:
+                            # A deferred mode cloned scheduler-owned
+                            # out_cache_loc staging into seed-private storage on
+                            # forward_stream.  Fence future schedule_stream
+                            # staging rewrites behind that tiny snapshot copy.
+                            self.schedule_stream.wait_event(
+                                batch_result.dflash_seed_input_ready_event
+                            )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3707,7 +3741,22 @@ class Scheduler(
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
-                            if _is_hip:
+                            if batch_result.dflash_egress_ready_event is not None:
+                                # A CAR-DFLASH deferred mode: the exact sampled
+                                # token/logprob tensors are complete before the
+                                # side-stream draft seed.  Waiting on this event
+                                # lets D2H and client egress overtake seed work;
+                                # cache publication/release is separately gated
+                                # by dflash_seed_ready_event in result processing.
+                                self.copy_stream.wait_event(
+                                    batch_result.dflash_egress_ready_event
+                                )
+                                with self.copy_stream_ctx:
+                                    batch_result.copy_to_cpu(
+                                        return_logprob=batch.return_logprob,
+                                        return_hidden_states=batch.return_hidden_states,
+                                    )
+                            elif _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
                                 batch_result.copy_to_cpu(
@@ -3759,10 +3808,18 @@ class Scheduler(
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
                 batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                if batch_result.dflash_egress_ready_event is not None:
+                    self.copy_stream.wait_event(batch_result.dflash_egress_ready_event)
+                    with self.copy_stream_ctx:
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
+                else:
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

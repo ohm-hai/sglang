@@ -108,6 +108,22 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    # CAR-DFLASH prefill experiment.  ``dflash_egress_ready_event`` is the
+    # earliest point at which the exact sampled token and target logprob outputs
+    # may be copied.  It is deliberately distinct from
+    # ``dflash_seed_ready_event``, which protects draft-KV reuse/reclamation.
+    # These are unset on the default eager path.
+    dflash_car_mode: Optional[str] = None
+    dflash_egress_ready_event: Optional[torch.cuda.Event] = None
+    dflash_token_ready_event: Optional[torch.cuda.Event] = None
+    dflash_seed_input_ready_event: Optional[torch.cuda.Event] = None
+    dflash_seed_ready_event: Optional[torch.cuda.Event] = None
+    dflash_target_start_event: Optional[torch.cuda.Event] = None
+    dflash_seed_start_event: Optional[torch.cuda.Event] = None
+    dflash_projection_start_event: Optional[torch.cuda.Event] = None
+    dflash_projection_ready_event: Optional[torch.cuda.Event] = None
+    dflash_profile_metadata: Optional[dict] = None
+
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced

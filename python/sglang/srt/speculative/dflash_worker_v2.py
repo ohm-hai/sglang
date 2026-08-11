@@ -192,6 +192,41 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
+        # CAR-DFLASH is deliberately opt-in.  Both deferred modes separate
+        # exact-token egress from prompt draft-KV readiness.  deferred_serial
+        # keeps the original global model-work barrier; deferred_overlap moves
+        # that barrier to only batches containing a seed-owning request.
+        self._car_seed_mode = str(server_args.speculative_dflash_seed_mode).replace(
+            "-", "_"
+        )
+        if self._car_seed_mode not in (
+            "eager",
+            "profile",
+            "deferred_serial",
+            "deferred_overlap",
+        ):
+            raise ValueError(
+                "Invalid DFLASH seed mode "
+                f"{server_args.speculative_dflash_seed_mode!r}; expected eager, "
+                "profile, deferred-serial, or deferred-overlap."
+            )
+        self._car_profile_every_n = int(server_args.speculative_dflash_profile_every_n)
+        if self._car_profile_every_n <= 0:
+            raise ValueError(
+                "speculative_dflash_profile_every_n must be positive, got "
+                f"{self._car_profile_every_n}."
+            )
+        self._car_prefill_count = 0
+        self._car_seed_stream = None
+        if self._car_seed_mode in ("deferred_serial", "deferred_overlap"):
+            if not (is_cuda() or is_hip()):
+                raise ValueError("DFLASH deferred seeding requires a CUDA/HIP stream.")
+            device_module = torch.get_device_module(self.device)
+            self._car_seed_stream = device_module.Stream(priority=0)
+            # A few backends allocate from a small round-robin stream pool.  A
+            # distinct stream is required or the egress/seed split is illusory.
+            self._car_ensure_distinct_seed_stream(self.model_runner.forward_stream)
+
         bundle = build_draft_tp_worker(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -294,6 +329,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+        if self.ps.tp_rank == 0 and self._car_seed_mode != "eager":
+            logger.warning(
+                "CAR-DFLASH experimental seed mode enabled: mode=%s, profile_every_n=%d. "
+                "Deferred modes change first-token egress ordering; cache publication "
+                "and every batch containing the seed owner remain seed-gated.",
+                self._car_seed_mode.replace("_", "-"),
+                self._car_profile_every_n,
+            )
 
     @property
     def draft_worker(self):
@@ -1025,6 +1069,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        phase_events: Optional[dict] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1101,7 +1146,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(torch.int32)
 
         with torch.inference_mode():
+            if phase_events is not None:
+                phase_events["projection_start"] = self._car_record_event()
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if phase_events is not None:
+                phase_events["projection_ready"] = self._car_record_event()
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1378,6 +1427,97 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _car_record_event(self, *, enable_timing: bool = True):
+        """Record an event on the current device stream.
+
+        Event elapsed-time is read only after an existing result/seed dependency
+        has completed.  Non-profiled deferred batches use timing-disabled events
+        so the correctness dependency does not pay timestamp instrumentation.
+        """
+        if not (is_cuda() or is_hip()):
+            return None
+        event = torch.get_device_module(self.device).Event(enable_timing=enable_timing)
+        event.record()
+        return event
+
+    def _car_should_profile_prefill(self) -> bool:
+        self._car_prefill_count += 1
+        return (
+            self._car_seed_mode != "eager"
+            and self._car_prefill_count % self._car_profile_every_n == 0
+        )
+
+    @staticmethod
+    def _car_streams_alias(lhs, rhs) -> bool:
+        if lhs is rhs:
+            return True
+        lhs_handle = getattr(lhs, "cuda_stream", None)
+        rhs_handle = getattr(rhs, "cuda_stream", None)
+        return (
+            lhs_handle is not None
+            and rhs_handle is not None
+            and lhs_handle == rhs_handle
+        )
+
+    def _car_ensure_distinct_seed_stream(self, producer_stream) -> None:
+        """Ensure side-stream waits cannot accidentally become self-waits.
+
+        Overlap executes the worker in ``model_runner.forward_stream``.  The
+        non-overlap loop can execute it in the scheduler's current stream
+        instead, so checking only the model-runner stream during construction is
+        insufficient on backends with a fixed round-robin stream pool.
+        """
+        assert self._car_seed_stream is not None
+        if not self._car_streams_alias(self._car_seed_stream, producer_stream):
+            return
+        device_module = torch.get_device_module(self.device)
+        for _ in range(64):
+            candidate = device_module.Stream(priority=0)
+            if not self._car_streams_alias(candidate, producer_stream):
+                self._car_seed_stream = candidate
+                return
+        raise RuntimeError(
+            "DFLASH deferred seeding could not allocate a seed stream distinct "
+            "from the active producer stream."
+        )
+
+    def _materialize_prefill_draft_kv(
+        self,
+        *,
+        batch: ScheduleBatch,
+        target_hidden: torch.Tensor,
+        cache_loc: Optional[torch.Tensor] = None,
+        phase_events: Optional[dict] = None,
+    ) -> None:
+        """Build draft prompt KV for precisely the uncached extend rows."""
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "DFLASH expected extend_lens / prefix_lens to be populated in "
+                "extend mode, but got None."
+            )
+        if cache_loc is None:
+            cache_loc = batch.out_cache_loc
+        if cache_loc is None:
+            raise RuntimeError("DFLASH prefill expected out_cache_loc, but got None.")
+
+        device = target_hidden.device
+        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+        draft_seq_lens = torch.tensor(
+            batch.prefix_lens, dtype=torch.int32, device=device
+        )
+        positions, _ = compute_position(
+            self.model_runner.prefill_attention_backend_str,
+            draft_seq_lens,
+            ctx_lens,
+            int(sum(batch.extend_lens)),
+        )
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            phase_events=phase_events,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1387,6 +1527,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            profile_this_batch = (
+                self._car_seed_mode != "eager" and self._car_should_profile_prefill()
+            )
+            target_start_event = (
+                self._car_record_event() if profile_this_batch else None
+            )
+
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=CaptureHiddenMode.FULL
@@ -1395,6 +1542,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output, next_token_ids = (
                 batch_output.logits_output,
                 batch_output.next_token_ids,
+            )
+            # Sampling is enqueued by target_worker before it returns.  In a
+            # deferred mode this event is both the D2H egress dependency and
+            # the producer dependency for side-stream seed construction.
+            token_ready_event = (
+                self._car_record_event(enable_timing=profile_this_batch)
+                if profile_this_batch
+                or self._car_seed_mode in ("deferred_serial", "deferred_overlap")
+                else None
             )
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
@@ -1406,35 +1562,82 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
 
-            if batch.extend_lens is None or batch.prefix_lens is None:
-                raise RuntimeError(
-                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
-                    "but got None."
-                )
+            target_hidden = logits_output.hidden_states
+            seed_start_event = None
+            seed_input_ready_event = None
+            seed_ready_event = None
+            seed_phase_events = {} if profile_this_batch else None
+            if self._car_seed_mode in ("deferred_serial", "deferred_overlap"):
+                assert token_ready_event is not None
+                assert self._car_seed_stream is not None
+                if batch.out_cache_loc is None:
+                    raise RuntimeError(
+                        "DFLASH prefill expected out_cache_loc, but got None."
+                    )
 
-            # Materialize prompt tokens into the draft KV cache immediately. This is required
-            # for radix cache safety (the scheduler may update radix after prefill returns).
-            device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+                device_module = torch.get_device_module(self.device)
+                forward_stream = device_module.current_stream()
+                self._car_ensure_distinct_seed_stream(forward_stream)
+                assert self._car_seed_stream is not None
 
-            if batch.out_cache_loc is None:
-                raise RuntimeError(
-                    "DFLASH prefill expected out_cache_loc, but got None."
+                # ScheduleBatch fields may be views into scheduler-owned staging
+                # buffers that are rewritten under overlap.  Snapshot the actual
+                # slot IDs into seed-private storage on the producer stream.  Keep
+                # token_ready_event before this copy so exact-token D2H does not
+                # inherit even this small bookkeeping dependency.
+                seed_cache_loc = batch.out_cache_loc.clone()
+                seed_input_ready_event = self._car_record_event(
+                    enable_timing=profile_this_batch
                 )
-            positions, _ = compute_position(
-                self.model_runner.prefill_attention_backend_str,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
+                self._car_seed_stream.wait_event(seed_input_ready_event)
+
+                # target_hidden was allocated/produced on forward_stream but is
+                # consumed on the seed stream.  record_stream prevents the CUDA
+                # caching allocator from recycling its storage after we clear it
+                # from logits_output below.  out_cache_loc is also marked for the
+                # same reason (not merely kept as a Python ref).
+                target_hidden.record_stream(self._car_seed_stream)
+                seed_cache_loc.record_stream(self._car_seed_stream)
+                with device_module.stream(self._car_seed_stream):
+                    if profile_this_batch:
+                        seed_start_event = self._car_record_event()
+                    self._materialize_prefill_draft_kv(
+                        batch=batch,
+                        target_hidden=target_hidden,
+                        cache_loc=seed_cache_loc,
+                        phase_events=seed_phase_events,
+                    )
+                    seed_ready_event = self._car_record_event(
+                        enable_timing=profile_this_batch
+                    )
+
+                # Make the pending write visible to every generic CPU-side
+                # release/cache/offload path, including abort/retraction that
+                # can run before this GenerationBatchResult is processed under
+                # overlap scheduling.  In deferred-serial the global producer
+                # barrier orders a later seed for the same request; in
+                # deferred-overlap the scheduler's request-owned batch barrier
+                # supplies the same ordering before that request can run again.
+                for req in batch.reqs:
+                    req.dflash_pending_seed_event = seed_ready_event
+
+                if self._car_seed_mode == "deferred_serial":
+                    # Conservative mode: all later target/draft work waits.
+                    forward_stream.wait_event(seed_ready_event)
+                # deferred-overlap deliberately omits the global wait.  The
+                # scheduler inserts an equivalent wait before a later batch
+                # containing any request above, while independent target
+                # prefills may overtake this local-only draft-KV materializer.
+            else:
+                if profile_this_batch:
+                    seed_start_event = self._car_record_event()
+                self._materialize_prefill_draft_kv(
+                    batch=batch,
+                    target_hidden=target_hidden,
+                    phase_events=seed_phase_events,
+                )
+                if profile_this_batch:
+                    seed_ready_event = self._car_record_event()
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -1443,6 +1646,59 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bonus_tokens=next_token_ids,
                 seq_lens=batch.seq_lens,
             )
+            if profile_this_batch or self._car_seed_mode in (
+                "deferred_serial",
+                "deferred_overlap",
+            ):
+                batch_output.dflash_car_mode = self._car_seed_mode.replace("_", "-")
+                batch_output.dflash_egress_ready_event = (
+                    token_ready_event
+                    if self._car_seed_mode in ("deferred_serial", "deferred_overlap")
+                    else None
+                )
+                batch_output.dflash_token_ready_event = token_ready_event
+                batch_output.dflash_seed_input_ready_event = seed_input_ready_event
+                batch_output.dflash_seed_ready_event = seed_ready_event
+                batch_output.dflash_target_start_event = target_start_event
+                batch_output.dflash_seed_start_event = seed_start_event
+                batch_output.dflash_projection_start_event = (
+                    None
+                    if seed_phase_events is None
+                    else seed_phase_events.get("projection_start")
+                )
+                batch_output.dflash_projection_ready_event = (
+                    None
+                    if seed_phase_events is None
+                    else seed_phase_events.get("projection_ready")
+                )
+                if profile_this_batch:
+                    hidden_bytes = int(target_hidden.numel()) * int(
+                        target_hidden.element_size()
+                    )
+                    batch_output.dflash_profile_metadata = {
+                        "batch_level": True,
+                        "tp_rank": int(self.ps.tp_rank),
+                        "rids": [str(req.rid) for req in batch.reqs],
+                        "num_requests": len(batch.reqs),
+                        "prefix_tokens": int(sum(batch.prefix_lens or [])),
+                        "extend_tokens": int(sum(batch.extend_lens or [])),
+                        "prefix_tokens_per_req": [
+                            int(x) for x in (batch.prefix_lens or [])
+                        ],
+                        "extend_tokens_per_req": [
+                            int(x) for x in (batch.extend_lens or [])
+                        ],
+                        "captured_hidden_bytes": hidden_bytes,
+                        "draft_cache_write_tokens": int(
+                            0
+                            if batch.out_cache_loc is None
+                            else batch.out_cache_loc.numel()
+                        ),
+                        "fused_materializer": bool(
+                            self._use_fused_kv_materialize
+                            and self._fused_kv_helper is not None
+                        ),
+                    }
             return batch_output
 
         # Decode / target-verify stage.
