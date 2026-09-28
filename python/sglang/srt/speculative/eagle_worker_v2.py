@@ -2090,6 +2090,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # accept_lens tokens (not 1) for each running row.
         batch_output.mixed_verify_running_bs = running_bs
         batch_output.mixed_verify_chain_len = chain_len
+        # Spec metrics: num_generated = num_correct_drafts + bs * non_draft_per_req
+        # must equal prefill_bs * 1 + sum(accept_lens). With the default
+        # non_draft=1 this gives num_correct_drafts = sum(accept_lens) - running_bs
+        # (accepted drafts excluding each running row's bonus token; prefill rows
+        # contribute their sampled token via the non-draft term).
+        batch_output.num_correct_drafts = int(accept_lens.sum().item()) - running_bs
 
         # Spec_v2 convention: new_seq_lens = length BEFORE this iter's tokens for
         # prefill rows; running rows advance by accept_lens.
