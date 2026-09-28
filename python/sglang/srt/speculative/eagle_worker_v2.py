@@ -2226,6 +2226,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.extend_lens,
             batch.prefix_lens,
             batch.extend_num_tokens,
+            batch.forward_mode,
         )
         running_bs = len(batch.reqs) - prefill_bs
         batch.seq_lens = batch.seq_lens[prefill_bs:]
@@ -2258,7 +2259,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.extend_lens,
             batch.prefix_lens,
             batch.extend_num_tokens,
+            batch.forward_mode,
         )
+        # Pure-prefill draft extend must run in EXTEND mode. The running-row
+        # draft extend above leaves batch.forward_mode = DRAFT_EXTEND_V2 (set
+        # by prepare_for_draft_extend, never restored upstream), which would
+        # route the DSA indexer down the paged decode path and mismatch the
+        # deep_gemm schedule metadata batch size against the prefill tokens.
+        batch.forward_mode = ForwardMode.EXTEND
         batch.seq_lens = batch.seq_lens[:prefill_bs]
         batch.seq_lens_cpu = (
             batch.seq_lens_cpu[:prefill_bs] if batch.seq_lens_cpu is not None else None
@@ -2291,6 +2299,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.extend_lens,
             batch.prefix_lens,
             batch.extend_num_tokens,
+            batch.forward_mode,
         ) = saved
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
