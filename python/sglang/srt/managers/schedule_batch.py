@@ -3216,8 +3216,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             # The spec relay is unresolved at schedule time, so merge_batch
             # would null seq_lens_cpu; rebuild the tails from request state.
+            # Mirror the device tails (tail_base + chain_len = r.seqlen - 1 +
+            # chain_len) so the host and device seq_lens agree before the
+            # overlap rebind; chain_len == 1 reproduces the legacy r.seqlen.
             running_seq_lens_cpu = torch.tensor(
-                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+                [int(r.seqlen) - 1 + chain_len for r in running_batch.reqs],
+                dtype=torch.int64,
             )
             if self.seq_lens_cpu is None:
                 merged_seq_lens_cpu = running_seq_lens_cpu

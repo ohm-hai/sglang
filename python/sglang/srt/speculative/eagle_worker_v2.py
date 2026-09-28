@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from typing import List, Optional
 
@@ -1913,6 +1914,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         prefill_bs = total_bs - running_bs
         device = self.device
 
+        if os.environ.get("SGLANG_VIM_DEBUG") and running_bs > 0:
+            logger.info(
+                f"[vim] mixed entry: prefill_bs={prefill_bs} running_bs={running_bs} "
+                f"seq_tails={batch.seq_lens[prefill_bs:].tolist()} "
+                f"seq_cpu_tails={batch.seq_lens_cpu[prefill_bs:].tolist() if batch.seq_lens_cpu is not None else None} "
+                f"prefix_tails={batch.prefix_lens[prefill_bs:] if batch.prefix_lens else None} "
+                f"extend_tails={batch.extend_lens[prefill_bs:] if batch.extend_lens else None} "
+                f"req_seqlens={[r.seqlen for r in batch.reqs[prefill_bs:]]} "
+                f"ocl_tail={batch.out_cache_loc[-running_bs * chain_len:].tolist() if batch.out_cache_loc is not None else None}"
+            )
+
         # -- 1. Draft the chain for the running requests ---------------------
         # batch.spec_info is the running batch's EagleDraftInput (prefill rows
         # contributed None). draft() sizes its buffers off batch.seq_lens, so
@@ -1937,7 +1949,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # chain_len; CPU tails: base = req.seqlen - 1.
         batch.seq_lens = batch.seq_lens[prefill_bs:] - chain_len
         if batch.seq_lens_cpu is not None:
-            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:] - 1
+            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:] - chain_len
         else:
             # MIXED batches leave seq_lens_cpu None; the draft's DSA prefill
             # metadata path asserts on it, so backfill from the device tensor
@@ -2079,8 +2091,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch.seq_lens = saved_seq_lens
         batch.forward_mode = saved_forward_mode
 
+        if os.environ.get("SGLANG_VIM_DEBUG"):
+            logger.info(
+                f"[vim] mixed step: prefill_bs={prefill_bs} running_bs={running_bs} "
+                f"accept_lens={accept_lens.tolist()}"
+            )
+
         # Roll back KV for rejected chain suffixes and commit accepted length.
-        new_running_seq_lens = batch.seq_lens[prefill_bs:] + accept_lens
+        # batch.seq_lens tails are the extend row length (committed base +
+        # chain_len); the new committed length is base + accept_lens, so step
+        # the chain rows back off before adding the accepted count. Matches the
+        # normal verify's new_seq_lens = committed_seq_lens + accept_lens.
+        new_running_seq_lens = batch.seq_lens[prefill_bs:] - chain_len + accept_lens
+        if os.environ.get("SGLANG_VIM_DEBUG") and running_bs > 0:
+            logger.info(
+                f"[vim] mixed publish: tails={batch.seq_lens[prefill_bs:].tolist()} "
+                f"accept_lens={accept_lens.tolist()} "
+                f"new_running_seq_lens={new_running_seq_lens.tolist()}"
+            )
 
         # -- 6. Assemble the result ------------------------------------------
         # next_token_ids layout for the output processor:
@@ -2249,7 +2277,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # base + 1 (CPU, req.seqlen), so step both back to the base.
         batch.seq_lens = batch.seq_lens[prefill_bs:] - chain_len
         if batch.seq_lens_cpu is not None:
-            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:] - 1
+            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:] - chain_len
         else:
             batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens.sum())

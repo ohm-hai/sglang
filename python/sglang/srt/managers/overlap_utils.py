@@ -487,19 +487,46 @@ class FutureMap:
         n = int(idx.shape[0])
         if n == 0:
             return
+        chain_len = int(getattr(batch, "mix_chain_len", 1))
         if self.publish_ready is not None:
             if _is_hip:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
         fresh = self.new_seq_lens_buf[idx]
+        if envs.SGLANG_VIM_DEBUG.get():
+            import logging
+
+            logging.getLogger(__name__).info(
+                f"[vim] resolve_mixed_spec_tails: n={n} "
+                f"chain_len={chain_len} "
+                f"fresh={fresh.tolist()} tails_before={batch.seq_lens[-n:].tolist()}"
+            )
+        # Each running row's seq_len is the committed base (fresh) plus its
+        # chain_len drafted tokens, matching eagle_prepare_for_verify's layout
+        # (chain tokens occupy [seq_lens, seq_lens + draft_token_num)). chain_len
+        # == 1 reproduces the legacy 1-token decode tail (fresh + 1).
         seq_lens = batch.seq_lens.clone()
-        seq_lens[-n:] = fresh + 1
+        seq_lens[-n:] = fresh + chain_len
         batch.seq_lens = seq_lens
         out_cache_loc = batch.out_cache_loc.clone()
-        out_cache_loc[-n:] = self.req_to_token[idx.long(), fresh.long()].to(
-            out_cache_loc.dtype
-        )
+        if chain_len == 1:
+            out_cache_loc[-n:] = self.req_to_token[idx.long(), fresh.long()].to(
+                out_cache_loc.dtype
+            )
+        else:
+            # verify-in-mixed: rebind all n * chain_len chain slots to the fresh
+            # committed base + [0, chain_len). The schedule-time slots lag the
+            # in-flight accept count, so they must all be rebuilt here.
+            chain_offsets = torch.arange(
+                chain_len, dtype=torch.int64, device=fresh.device
+            )
+            chain_positions = fresh.long().unsqueeze(1) + chain_offsets.unsqueeze(0)
+            out_cache_loc[-n * chain_len :] = (
+                self.req_to_token[idx.long().unsqueeze(1), chain_positions]
+                .reshape(-1)
+                .to(out_cache_loc.dtype)
+            )
         batch.out_cache_loc = out_cache_loc
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
@@ -516,7 +543,7 @@ class FutureMap:
             fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
         if batch.seq_lens_cpu is not None:
             seq_lens_cpu = batch.seq_lens_cpu.clone()
-            seq_lens_cpu[-n:] = fresh_cpu + 1
+            seq_lens_cpu[-n:] = fresh_cpu + chain_len
             batch.seq_lens_cpu = seq_lens_cpu
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         batch.prefix_lens = batch.prefix_lens[:-n] + [
@@ -540,7 +567,24 @@ class FutureMap:
         # running-only gather would drop the prefill rows and desync
         # batch_size from req_pool_indices. mix_with_running already set the
         # correct merged seq_lens, so skip the relay gather here.
-        if getattr(batch, "mix_chain_len", 1) > 1:
+        #
+        # Gate on forward_mode.is_mixed(), NOT mix_chain_len: the mixed batch
+        # object is reused as the next decode batch (scheduler keeps last_batch),
+        # and mix_chain_len is never reset, so a mix_chain_len gate would
+        # wrongly skip the relay for plain decode batches and freeze seq_lens.
+        _vim_skip = batch.forward_mode.is_mixed()
+        if envs.SGLANG_VIM_DEBUG.get() and (
+            _vim_skip or int(getattr(batch, "mix_chain_len", 1)) > 1
+        ):
+            import logging
+
+            logging.getLogger(__name__).info(
+                f"[vim] resolve_seq_lens: mode={batch.forward_mode} "
+                f"mix_chain_len={int(getattr(batch, 'mix_chain_len', 1))} "
+                f"bs={batch.seq_lens.shape[0] if batch.seq_lens is not None else None} "
+                f"fi_shape={tuple(fi.shape)} skipped={_vim_skip}"
+            )
+        if _vim_skip:
             return
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:

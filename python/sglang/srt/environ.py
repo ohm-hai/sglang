@@ -1450,6 +1450,8 @@ class Envs:
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    # verify-in-mixed debug logging (per-step accept lens, seq_lens rebinding).
+    SGLANG_VIM_DEBUG = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
