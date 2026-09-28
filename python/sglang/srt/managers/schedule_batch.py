@@ -3236,10 +3236,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
         # merge_batch only adopts the running batch's spec_info when the prefill
-        # batch already has one (it does not). For spec, the running rows' draft
-        # state (EagleDraftInput) must survive the merge so the EAGLE worker can
-        # draft their chains; adopt it here.
-        if not self.spec_algorithm.is_none() and running_batch.spec_info is not None:
+        # batch already has one (it does not). For verify-in-mixed, the running
+        # rows' draft state (EagleDraftInput) must survive the merge so the
+        # EAGLE worker can draft their chains; adopt it here. Gated on
+        # chain_len > 1: in the legacy degrade path the merged batch must stay
+        # spec_info-free (its draft-shaped positions would mis-size the
+        # prefill forward's registry buffers).
+        if (
+            chain_len > 1
+            and not self.spec_algorithm.is_none()
+            and running_batch.spec_info is not None
+        ):
             self.spec_info = running_batch.spec_info
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
