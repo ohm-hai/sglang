@@ -1928,9 +1928,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.out_cache_loc,
             batch.input_ids,
         )
-        batch.seq_lens = batch.seq_lens[prefill_bs:]
+        # The merged tails hold post-chain lengths (base + chain_len) for the
+        # mixed target forward, but the draft is a decode-mode forward that
+        # must sit at the committed base (bonus token pending), exactly as in
+        # the normal decode flow. Passing the merged length makes the DSA
+        # decode path read chain_len stale draft-KV slots from previous
+        # rounds, degrading chain quality. Device tails: base = merged -
+        # chain_len; CPU tails: base = req.seqlen - 1.
+        batch.seq_lens = batch.seq_lens[prefill_bs:] - chain_len
         if batch.seq_lens_cpu is not None:
-            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:]
+            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:] - 1
         else:
             # MIXED batches leave seq_lens_cpu None; the draft's DSA prefill
             # metadata path asserts on it, so backfill from the device tensor
@@ -2235,9 +2242,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.forward_mode,
         )
         running_bs = len(batch.reqs) - prefill_bs
-        batch.seq_lens = batch.seq_lens[prefill_bs:]
+        # _draft_extend_for_decode expects seq_lens at the committed base
+        # (bonus pending), as in the normal decode flow: prepare_for_draft_extend
+        # derives the extend window [seq_lens, seq_lens + chain_len) and RoPE
+        # positions from it. The merged tails hold base + chain_len (device) /
+        # base + 1 (CPU, req.seqlen), so step both back to the base.
+        batch.seq_lens = batch.seq_lens[prefill_bs:] - chain_len
         if batch.seq_lens_cpu is not None:
-            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:]
+            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:] - 1
         else:
             batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens.sum())
