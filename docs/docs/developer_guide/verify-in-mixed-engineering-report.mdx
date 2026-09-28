@@ -1,0 +1,821 @@
+---
+title: "Verify-in-mixed: engineering report"
+description: "Research findings, implementation status, correctness fixes, CUDA Graph plan, and remaining work for EAGLE/MTP verification inside mixed chunked-prefill batches."
+---
+
+<Warning>
+This page describes an experimental research branch, not a production-ready
+feature. The implementation has been validated only with GLM-5.2-FP8,
+NEXTN/EAGLE V2, a linear draft chain (`topk=1`), TP8, DSA attention, and NVIDIA
+H200 GPUs. Correctness is validated after the latest fixes, but a final
+post-fix performance sweep has not been completed.
+</Warning>
+
+## Executive status
+
+The investigation started from a serving problem: mixed chunked prefill lowers
+prefill latency, but existing SGLang behavior converts running speculative
+decode requests into one-token extend rows during mixed steps. Those requests
+do not perform target verification until a later pure-decode step. At high
+concurrency, this improves time to first token (TTFT) while degrading decode
+time per output token (TPOT).
+
+The work has produced four concrete results:
+
+1. **The MoE premise is confirmed.** In a mixed prefill/decode forward, 85–100%
+   of the experts selected by decode rows were already selected by the prefill
+   chunk, depending on the layer. Verification can therefore add little or no
+   incremental expert-weight traffic when it runs with a large prefill.
+2. **The missing SGLang execution path is implemented.** Running requests now
+   carry a full linear draft chain into a mixed batch. One target forward
+   handles both the prefill tokens and verification tokens.
+3. **The chain and KV-cache state are correct after the latest fixes.**
+   Multi-request overlap, pure decode after mixed execution, and long-prefill
+   stress probes now preserve draft acceptance and output quality.
+4. **The final speedup is not yet established.** Earlier verify-in-mixed
+   benchmarks were collected before the final sequence-length and cache-slot
+   fixes. They are invalid as performance evidence. The current implementation
+   also forces two draft phases to run eagerly and misses prefill CUDA Graphs
+   for 8K-token chunks.
+
+The working branch is
+[`ohm-hai/sglang:verify-in-mixed`](https://github.com/ohm-hai/sglang/tree/verify-in-mixed).
+
+### Current status
+
+- [x] Run GLM-5.2-FP8 with built-in MTP/NEXTN on TP8.
+- [x] Measure sequential and mixed chunked-prefill behavior.
+- [x] Profile target verify, draft, prefill, MoE, attention, and communication.
+- [x] Measure unique-expert activation by forward type and layer.
+- [x] Implement verify-in-mixed for a linear EAGLE/MTP chain.
+- [x] Implement acceptance, rejection rollback, and output accounting.
+- [x] Implement draft extension for both prefill and running rows.
+- [x] Fix overlap relay, sequence-length, and KV-slot corruption.
+- [x] Validate one and eight concurrent running requests under long prefill.
+- [x] Validate pure decode after mixed-batch execution.
+- [ ] Add automated unit and integration coverage.
+- [ ] Capture the 8K mixed target forward with Breakable CUDA Graph.
+- [ ] Re-enable CUDA Graphs for the mixed draft and draft-extend phases.
+- [ ] Run a same-build, post-fix paper-grade benchmark sweep.
+- [ ] Validate additional models, backends, and serving features.
+
+## Research question
+
+An EAGLE/MTP iteration has three major phases:
+
+1. The draft model proposes a token chain.
+2. The target model verifies the chain.
+3. The draft model extends its state from the accepted prefix.
+
+For a sparse MoE model, target verification can be expensive at low batch size.
+One autoregressive token activates at most `top_k` routed experts per layer, but
+verifying several tokens activates a much larger expert set. Loading those
+expert weights dominates a small verification forward.
+
+Chunked prefill creates a second workload at the same time. A large prefill
+chunk already activates most of the experts that the verification tokens need.
+The research question is:
+
+> Can SGLang verify running speculative requests inside the same target forward
+> as a prefill chunk, preserving speculative acceptance while avoiding a
+> separate MoE weight-loading pass?
+
+The intended serving regime is low-batch, latency-sensitive generation, such
+as real-time voice serving, where decode inter-token latency is a hard
+constraint and a newly arriving long prompt must not stall running streams.
+
+## Experimental setup
+
+The measurements in this report use:
+
+- **Hardware:** 8× NVIDIA H200, 143 GB per GPU.
+- **Model:** `zai-org/GLM-5.2-FP8`, stored locally as
+  `/scratch/models/GLM-5.2-FP8`.
+- **Model structure:** 78 target layers, one NextN prediction layer, 256 routed
+  experts, top-8 expert routing, FP8 weights, and DSA sparse attention.
+- **Parallelism:** tensor parallel size 8.
+- **Speculation:** NEXTN/EAGLE, three draft steps, `topk=1`, and four draft
+  tokens.
+- **Chunked prefill:** 8,192 tokens.
+- **Benchmark workload:** 16,384 input tokens and 256 output tokens unless
+  otherwise stated.
+- **Software checkout:** an editable SGLang installation from `/root/sglang`.
+
+The validated server command is:
+
+```bash
+HF_HOME=/scratch/hf python -m sglang.launch_server \
+  --model-path /scratch/models/GLM-5.2-FP8 \
+  --served-model-name glm-5.2 \
+  --tp 8 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm45 \
+  --disable-shared-experts-fusion \
+  --mem-fraction-static 0.88 \
+  --enable-mixed-chunk \
+  --enable-verify-in-mixed \
+  --port 30000
+```
+
+`--enable-verify-in-mixed` requires `--enable-mixed-chunk`. The experimental
+path currently rejects tree speculation because only a linear chain
+(`--speculative-eagle-topk 1`) is attention-equivalent to causal extend rows.
+
+## Baseline: why existing mixed chunking is insufficient
+
+We compared two existing scheduling forms before implementing verify-in-mixed:
+
+- **Form 1, sequential:** prefill chunks and decode/verify iterations alternate.
+- **Form 2, mixed:** prefill and running decode requests share a target forward,
+  but each running request contributes only one token. Speculative verification
+  is deferred.
+
+Initial end-to-end results were:
+
+| Concurrency | Form 1 TPOT (ms) | Form 2 TPOT (ms) | Form 1 TTFT (s) | Form 2 TTFT (s) | Form 1 output tok/s | Form 2 output tok/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3.35 | 3.35 | 1.05 | 1.04 | 134 | 135 |
+| 4 | 11.38 | 12.74 | 3.04 | 2.57 | 172 | 175 |
+| 8 | 16.38 | 15.38 | 3.54 | 3.72 | 265 | 267 |
+| 16 | 47.35 | 57.34 | 11.56 | 9.37 | 173 | 170 |
+| 32 | 61.49 | 88.84 | 27.88 | 22.94 | 177 | 174 |
+
+A later same-build rerun confirmed the important endpoints:
+
+- At concurrency 8, Form 1 and Form 2 were close: 16.4 ms versus 16.9 ms TPOT.
+- At concurrency 32, Form 2 regressed to 89.2 ms TPOT versus 61.5 ms for
+  Form 1, while retaining better TTFT.
+
+The result is a scheduler tradeoff, not a model acceptance problem. Existing
+mixed chunking gets prefill work onto the GPU sooner, but running requests lose
+speculative progress during those mixed steps.
+
+<Note>
+The aggregate `spec_accept_length` metric can hide this degradation. Mixed
+one-token steps do not necessarily increment the speculative verify counter,
+so a request can still report an acceptance length near 4 even though several
+iterations made only one-token progress. Wall-clock TPOT and per-step execution
+mode are the authoritative measurements.
+</Note>
+
+## Profiling results
+
+### Target verification is expensive at low batch size
+
+At concurrency 8:
+
+- One target verification step took approximately **33.3 ms**.
+- Three autoregressive draft steps took approximately **1.3 ms total**.
+- MoE kernels accounted for approximately **44%** of decode-stage GPU busy
+  time.
+- Including quantization, activation multiplication, alignment, and reduction,
+  the MoE complex accounted for approximately **64%** of verification time.
+- All-reduce accounted for approximately 9%, dense GEMMs 9%, attention 6%,
+  and the DSA indexer 2%.
+
+The Triton MoE backend was the best available backend in this setup.
+`deep_gemm` regressed concurrency-8 TPOT from approximately 16.4 ms to 25.2 ms,
+so switching existing backends did not solve the small-verification problem.
+
+### Verification expands the active expert set
+
+Per-token routing records produced the following unique-expert counts across
+the 256 global routed experts:
+
+| Forward type | Tokens in the measured pass | Mean unique experts per layer |
+| --- | ---: | ---: |
+| One-token autoregressive decode | 1 | at most 8 |
+| Target verify, concurrency 1 | 4 | 22.6 |
+| Target verify, concurrency 2–3 | 8–12 | 43–54 |
+| Extend prefill chunk | 8,192 | 139–184 |
+| Mixed prefill plus two decode rows | 8,130–8,192 | 175–195 |
+
+This explains why low-batch verification is not free by itself. Four verify
+tokens activate roughly 2.8× as many experts as one autoregressive token at
+concurrency 1. The grouped GEMMs remain small while the implementation must
+read many more expert weights.
+
+### Prefill already activates the verification experts
+
+For mixed forwards, the decode rows selected 14–16 experts per layer. Depending
+on the layer, **85–100%** of those experts were already selected by the prefill
+tokens.
+
+This establishes the central systems opportunity:
+
+- A separate verify pass pays to load its expanded expert set.
+- A large prefill pass has already loaded almost all of that set.
+- Adding verification rows to the prefill forward can reuse the same expert
+  groups and amortize launch, routing, and weight-read costs.
+
+This does not mean verification adds zero total work. Dense projections,
+attention, routing, output processing, and extra token rows remain. The
+confirmed claim is narrower: verification can be nearly free in incremental
+**expert-weight traffic**, which is the dominant cost in the measured regime.
+
+## Implemented design
+
+### Mixed-batch layout
+
+`ScheduleBatch.mix_with_running` constructs this logical layout:
+
+```text
+[ prefill request rows | running request rows ]
+
+prefill request row:
+  variable number of extend tokens
+
+running request row:
+  K causal chain tokens, where K = speculative_num_draft_tokens
+```
+
+The token axis is:
+
+```text
+[ all prefill tokens | request_0 chain[0:K] | ... | request_N chain[0:K] ]
+```
+
+The current implementation supports `topk=1`, so each speculative tree is a
+linear chain. A linear chain can be represented as ordinary causal extend
+tokens. A branching tree cannot use this representation without a tree
+attention mask and a different position/cache layout.
+
+### End-to-end execution
+
+The EAGLE V2 worker handles a verify-in-mixed iteration in seven stages:
+
+1. **Narrow to running rows and draft.** The worker temporarily views only the
+   running requests, switches to decode mode, and produces a `K`-token chain
+   for every request.
+2. **Write chain tokens.** The drafted tokens replace the placeholder tail in
+   `batch.input_ids`.
+3. **Run one target forward.** The target processes the prefill tokens and all
+   running chains in one mixed extend forward with full hidden-state capture.
+4. **Produce both kinds of logits.** Existing extend output supplies one next
+   token per prefill request. The worker applies the target LM head to every
+   running-chain hidden state to obtain verification logits.
+5. **Accept and roll back.** `eagle_sample` computes the accepted prefix. Cache
+   state after rejected chain suffixes is discarded logically by publishing
+   only the new committed frontier.
+6. **Assemble scheduler output.** Prefill requests commit one sampled token.
+   Running requests commit `accept_lens[i]` tokens from their accepted chain.
+7. **Extend draft state twice.** A decode-style draft extension updates running
+   requests from accepted chain hidden states. A prefill-style draft extension
+   initializes newly prefetched requests. The two `EagleDraftInput` objects are
+   merged in prefill-first order.
+
+### Sequence-length and cache-slot invariants
+
+The final debugging work established the invariants that every implementation
+and CUDA Graph path must preserve.
+
+Let:
+
+- `C` be the committed target KV length before the mixed iteration.
+- `K` be the number of chain rows per running request.
+- `A` be the accepted token count for that request.
+
+Then:
+
+```text
+target mixed-forward seq_len = C + K
+chain token positions         = [C, C + K)
+chain cache slots             = req_to_token[request, C:C + K]
+draft/draft-extend base       = C
+new committed length          = C + A
+```
+
+The overlap scheduler does not know the final accepted length of an in-flight
+iteration when it creates the next batch. The `FutureMap` publication is
+therefore authoritative. At forward entry, the mixed-tail resolver must:
+
+1. Read fresh committed lengths `C` from `new_seq_lens_buf`.
+2. Set both device and CPU tail lengths to `C + K`.
+3. Rebind all `N × K` target cache slots to contiguous positions
+   `C, C + 1, ..., C + K - 1`.
+4. Set each running prefix length to `C`.
+
+Before a decode-mode draft or running-row draft extension, the narrowed view
+subtracts `K` from both sequence-length mirrors. After acceptance, publication
+uses:
+
+```text
+new_seq_len = mixed_tail_seq_len - K + accept_len
+```
+
+The relay gather is skipped only while `forward_mode.is_mixed()`. It must run
+again when the same `ScheduleBatch` object becomes a normal decode batch.
+
+## Code changes
+
+The feature spans the scheduler, overlap relay, speculative worker, and result
+processor:
+
+| File | Responsibility |
+| --- | --- |
+| `python/sglang/srt/arg_groups/fields/schedule.py` | Defines `--enable-verify-in-mixed`. |
+| `python/sglang/srt/arg_groups/validation_hook.py` | Requires mixed chunking and rejects `topk > 1`. |
+| `python/sglang/srt/managers/scheduler.py` | Enables the feature only for supported speculative generation. |
+| `python/sglang/srt/managers/schedule_batch.py` | Reserves `K` chain rows and cache slots per running request and carries running speculative state into the mixed batch. |
+| `python/sglang/srt/managers/overlap_utils.py` | Resolves mixed inputs, late-binds fresh sequence lengths, and rebinds all chain cache slots under overlap. |
+| `python/sglang/srt/speculative/eagle_worker_v2.py` | Drafts, runs the mixed target forward, verifies, publishes, and extends draft state. |
+| `python/sglang/srt/managers/scheduler_components/batch_result_processor.py` | Commits a variable accepted-token prefix for running rows. |
+| `python/sglang/srt/managers/utils.py` | Carries mixed-result metadata between the worker and result processor. |
+| `python/sglang/srt/environ.py` | Defines temporary `SGLANG_VIM_DEBUG` diagnostics. |
+
+The branch contains six feature commits:
+
+1. Initial scheduler and EAGLE V2 verify-in-mixed implementation.
+2. Correct prefill-row draft-extension mode.
+3. Isolation of feature-only speculative state adoption.
+4. Speculative acceptance metric accounting.
+5. Running draft and draft-extend narrowing to the committed base.
+6. Chain-length-aware relay, cache-slot, publication, and decode-transition
+   fixes.
+
+## Failures found and fixed
+
+The implementation exposed several state assumptions that do not appear in
+the normal pure-prefill or pure-decode paths.
+
+### Draft preparation failures
+
+1. **Missing CPU sequence lengths.** The DSA draft path required
+   `seq_lens_cpu`, but mixed batches could leave it unset. The narrowed draft
+   view now supplies a host mirror.
+2. **Wrong attention path.** Drafting inherited `ForwardMode.MIXED` and entered
+   an extend metadata path. The narrowed draft runs in `ForwardMode.DECODE`.
+3. **Eager registry shape mismatch.** The draft mutates one input token per
+   autoregressive step while the merged batch still owns a larger cache-location
+   tensor. The mixed draft avoids the irrelevant eager input copy.
+4. **Merged input leakage.** The full mixed `input_ids` tensor leaked into the
+   running-only draft. The narrowed view clears it because EAGLE reads draft
+   inputs from `spec_info`.
+
+### Target mixed-forward failures
+
+5. **Relay gather dropped prefill rows.** `resolve_seq_lens_cpu` replaced the
+   merged sequence-length tensor with a running-only gather. The relay skips
+   that gather for the active mixed forward.
+6. **Stale speculative positions.** The running batch's draft-shaped
+   `spec_info.positions` was adopted by the full mixed target forward. It is
+   cleared so `ForwardBatch` recomputes positions for the complete token axis.
+7. **Feature-disabled regression.** Adopting running `spec_info` also affected
+   ordinary mixed chunking when the feature flag was off. Adoption is now
+   gated on `K > 1`.
+
+### Draft-extension failures
+
+8. **Running cache locations were not narrowed.** Decode-style draft extension
+   received all prefill and chain slots. It now receives only the tail
+   `running_bs × K` slots.
+9. **Prefill metadata was not narrowed.** Prefill-style draft extension
+   inherited running rows and chain cache locations. It now receives only the
+   prefill rows and their token slots.
+10. **Forward mode leaked between draft extensions.** Running draft extension
+    sets `DRAFT_EXTEND_V2`. Upstream code normally does not reuse that batch
+    object, so the mode was not restored. The prefill extension entered a paged
+    decode path with a schedule built for the wrong batch size. Narrow helpers
+    now save and restore the mode, and the prefill view explicitly uses
+    `ForwardMode.EXTEND`.
+
+### Final chain corruption
+
+11. **The mixed-tail resolver assumed `K=1`.** It wrote `C + 1` instead of
+    `C + K`, so draft and target metadata disagreed about the chain frontier.
+12. **Only one cache slot per request was rebound.** The first `K - 1` slots
+    remained stale while the final slot moved to the fresh base. Under a long
+    prefill this produced non-contiguous locations and eventually an illegal
+    memory access in the DSA K-index store. The resolver now rebinds all
+    `N × K` slots.
+13. **CPU and device mirrors represented different frontiers.** The schedule
+    path used the legacy one-token CPU value while the device tensor represented
+    a chain. Both now represent `C + K` and both narrow by `K`.
+14. **Publication advanced from the end of the reserved chain.** Adding `A`
+    directly to `C + K` caused positive drift. Publication now computes
+    `C + A`.
+15. **A persistent feature field froze later decode lengths.** The mixed batch
+    object becomes the next running batch, but `mix_chain_len` was not reset.
+    Using that field to skip relay resolution also skipped normal decode
+    updates. The skip condition now tests the current forward mode.
+
+These fixes removed the low-acceptance, batch-position-dependent behavior and
+the DSA illegal memory access.
+
+## Correctness validation
+
+### Long prefill with one running request
+
+A running request generated while a 60,000-word prompt was prefetched in
+chunks. The request retained coherent output and the mixed path no longer
+crashed. Instrumentation showed:
+
+- `tail_seq_len = C + 4` on device and CPU.
+- Four contiguous target cache slots beginning at `C`.
+- Publication equal to `C + accept_len`.
+- No monotonic sequence-length drift.
+
+### Long prefill with eight running requests
+
+Eight concurrent requests generated 3,000 tokens each while a 60,000-word
+request prefetched. Their aggregate speculative acceptance lengths were tightly
+clustered:
+
+```text
+4.0706, 4.0650, 4.0650, 4.0595,
+4.0595, 4.0541, 4.0486, 4.0431
+```
+
+For full-size `running_bs=8` mixed steps, the debug log recorded 96 occurrences
+of:
+
+```text
+accept_lens=[4, 4, 4, 4, 4, 4, 4, 4]
+```
+
+The earlier corrupted implementation produced acceptance values around 1–2
+for the same mixed shape.
+
+### Pure decode after mixed execution
+
+Eight identical cached requests ran without any active prefill after prior
+mixed execution. Acceptance remained tightly clustered between 3.984 and
+3.995. Before the relay-skip fix, pure-decode acceptance varied by batch
+position from approximately 1.6 to 3.0.
+
+### What is not yet covered
+
+The manual probes establish the core state invariants but do not replace
+automated coverage. The following cases still need tests:
+
+- Acceptance lengths from 1 through `K`, including repeated rejection.
+- Request completion, EOS, cancellation, and retraction during mixed execution.
+- Page-boundary and KV-allocation-boundary transitions.
+- Prefix-cache hits and partial cache hits.
+- More than one prefill row in the mixed batch.
+- Maximum running-request count and uneven request lengths.
+- Sampling above temperature zero.
+- Grammar constraints, penalties, logprobs, and custom logit processors.
+- DP attention, pipeline parallelism, expert parallelism, LoRA, and
+  disaggregation.
+- Attention backends other than the tested GLM-5.2 DSA path.
+
+## Performance status
+
+<Warning>
+Do not use the existing verify-in-mixed sweep as the final performance result.
+It ran before the latest chain-length and cache-slot fixes.
+</Warning>
+
+The invalidated sweep reported:
+
+- Concurrency 8: approximately 43 ms TPOT.
+- Concurrency 32: approximately 106–114 ms TPOT.
+- Aggregate acceptance around 2.7 instead of approximately 4.
+
+Those runs mixed three effects:
+
+1. Draft attention read stale KV positions.
+2. Draft extension wrote future state at shifted positions.
+3. The mixed draft and running draft-extension paths ran eagerly.
+
+The first two are correctness defects and are now fixed. The third is a real
+performance gap that remains.
+
+No paper-quality claim should be made until the same server build is used for
+all three modes after the final fixes:
+
+- Sequential chunked prefill.
+- Existing mixed chunked prefill.
+- Mixed chunked prefill with verify-in-mixed.
+
+## Why CUDA Graph coverage is the next priority
+
+The default Breakable CUDA Graph prefill token buckets stop at 2,048 tokens.
+The measured workload uses an 8,192-token chunk. Therefore:
+
+- Sequential prefill chunks run eagerly.
+- Existing mixed chunks run eagerly.
+- Verify-in-mixed target forwards run eagerly.
+
+The mixed EAGLE worker also temporarily disables:
+
+- `draft_worker.cuda_graph_runner` for the running draft.
+- `draft_worker.cuda_graph_runner_for_draft_extend` for running draft
+  extension.
+
+This was necessary to make the first dynamic-shape implementation correct, but
+it leaves Python dispatch and kernel-launch overhead on both sides of the large
+target forward.
+
+## Proposed hybrid CUDA Graph design
+
+The preferred design combines Breakable CUDA Graph for the mixed target
+forward with existing decode graphs for the running-only draft phases.
+
+### 1. Capture through the chunked-prefill ceiling
+
+Prefill `cuda_graph_config.prefill.bs` values are aggregate-token buckets, even
+though the field is named `bs`. Add high-token buckets through the maximum
+mixed-forward token count.
+
+For the tested configuration:
+
+```text
+chunked_prefill_size = 8192
+max_running_requests = 48
+chain_len = 4
+maximum mixed tokens = 8192 + 48 * 4 = 8384
+```
+
+Extend the existing bucket ladder with a small number of measured high-token
+buckets, for example 3,072, 4,096, 6,144, 8,192, and 8,384. Do not add every
+intermediate shape blindly; each shape increases startup and resident graph
+memory.
+
+Use the `breakable` prefill backend. GLM-5.2's DSA sparse indexer has
+runtime-dependent work and should remain in an eager break while the stable
+transformer and MoE regions replay as graph segments.
+
+Technical tasks:
+
+1. Add the high-token buckets to the launch configuration.
+2. Verify that mixed token padding preserves the prefill/running row boundary.
+3. Confirm that chain cache locations remain late-bound after static-buffer
+   loading.
+4. Measure graph hit rate for 8K chunks and the 8,384-token ceiling.
+5. Measure startup time and graph memory before and after adding the buckets.
+6. Verify that capture reaches `chunked_prefill_size`; stopping below it adds
+   resident graph memory without removing the largest eager activation peak.
+
+### 2. Reuse the decode graph for mixed drafting
+
+The draft operates only on running requests and has decode semantics. It should
+not use the full merged token axis.
+
+Replace temporary mutation of the merged `ScheduleBatch` with a dedicated
+running-only view or adapter containing:
+
+- Running `req_pool_indices`.
+- Running `EagleDraftInput`.
+- Committed-base sequence lengths `C`.
+- `ForwardMode.DECODE`.
+- One logical draft input per running request.
+- Padding rows mapped to the standard safe request-pool row.
+
+Then:
+
+1. Pad `running_bs` to an existing captured decode bucket.
+2. Load the running view into the existing draft CUDA Graph runner.
+3. Keep the real request rows first and mask padding rows.
+4. Return exactly `running_bs × K` draft tokens.
+5. Remove the code that sets `draft_worker.cuda_graph_runner = None`.
+
+The graph key should depend on the padded running batch size and configured
+chain geometry, not on the prefill token count.
+
+### 3. Reuse the draft-extend graph
+
+Running draft extension has a static maximum shape of `running_bs × K`, while
+`accept_lens` is data-dependent.
+
+The implementation should:
+
+1. Build a running-only draft-extend view at committed base `C`.
+2. Pad requests to a captured batch bucket.
+3. Keep `K` static token slots per padded request.
+4. Pass `accept_lens` as graph input data or a mask instead of changing tensor
+   shapes.
+5. Write draft KV only for the accepted prefix.
+6. Preserve the contiguous target and draft cache-slot mapping.
+7. Remove the code that disables
+   `cuda_graph_runner_for_draft_extend`.
+
+If accepted-prefix compaction cannot be captured safely, put only that
+operation in a Breakable CUDA Graph eager region and capture the stable model
+forward around it.
+
+### 4. Keep data-dependent operations eager
+
+The following operations should remain eager initially:
+
+- `eagle_sample`.
+- Accepted-prefix indexing.
+- Rejected-suffix rollback/accounting.
+- Future-map publication.
+- Request completion and output processing.
+
+They are small, data-dependent operations. Capturing them is lower priority
+than graphing the model forwards.
+
+### 5. Verify boundary-buffer lifetime
+
+Breakable CUDA Graph segments require stable device addresses at segment
+boundaries. Any tensor that crosses an eager break must be retained and updated
+in place.
+
+Audit:
+
+- DSA top-k indices.
+- Hidden states passed to draft extension.
+- Chain logits and sampled-token buffers.
+- Static `input_ids`, `seq_lens`, and `out_cache_loc` buffers.
+- Future-map buffers used by the overlap scheduler.
+
+Use one shared graph pool per captured shape and reuse the maximum-sized output
+buffer across shapes where the current graph infrastructure permits it.
+
+## Automated test plan
+
+Add focused tests before expanding compatibility.
+
+### Unit tests
+
+Add tests under `test/registered/unit/spec/` and
+`test/registered/unit/managers/` for:
+
+- The algebra `C + K`, `[C, C + K)`, and `C + A`.
+- Device and CPU mirror equality.
+- Rebinding all `N × K` cache locations.
+- `K=1` preserving legacy mixed behavior.
+- Relay skip only in `ForwardMode.MIXED`.
+- Result-processor token slicing for variable `accept_lens`.
+- Request KV committed-length accounting.
+
+### Integration tests
+
+Extend `test/registered/spec/test_spec_mixed_chunk.py` with:
+
+- One running request plus a multi-chunk prefill.
+- Eight running requests plus a multi-chunk prefill.
+- A transition from mixed execution back to pure decode.
+- Repeated low acceptance and full acceptance.
+- Cached and uncached prompt variants.
+- Page sizes and sequence lengths that cross allocation boundaries.
+- Feature-off parity with existing mixed chunking.
+
+Add CUDA Graph cases under:
+
+- `test/registered/cuda_graph/breakable/`
+- Existing speculative CUDA Graph fixtures in
+  `python/sglang/test/server_fixtures/`
+
+Tests should compare emitted token IDs and committed sequence lengths against a
+sequential reference, not only aggregate throughput or acceptance metrics.
+
+## Paper-grade benchmark plan
+
+### Main comparison
+
+Use one code revision and one warmed model server per mode:
+
+1. Sequential chunked prefill.
+2. Existing mixed chunked prefill.
+3. Verify-in-mixed, eager draft phases.
+4. Verify-in-mixed with expanded prefill BCG buckets.
+5. Verify-in-mixed with both prefill and draft graph coverage.
+
+For the main sweep:
+
+- Concurrency: 1, 4, 8, 16, and 32.
+- Input length: 16,384 tokens.
+- Output length: 256 tokens.
+- Chunk size: 8,192 tokens.
+- At least `5 × concurrency` requests after warmup.
+- Fixed model, sampling parameters, graph configuration, and random seed.
+
+Report:
+
+- Mean and p95/p99 TTFT.
+- Mean and p95/p99 TPOT.
+- Median and p95/p99 ITL.
+- Output throughput.
+- Per-request and per-mixed-step acceptance.
+- Mixed-step count and fraction of decode tokens generated in mixed steps.
+- CUDA Graph hit rate by phase.
+- Startup/capture time and resident graph memory.
+- Peak runtime memory.
+- Errors, retractions, and eager fallbacks.
+
+### Voice-style overlap benchmark
+
+The throughput sweep does not directly measure the target use case. Add a
+deadline-oriented benchmark:
+
+1. Start one or more long-running decode streams.
+2. Inject a long prompt after steady decode begins.
+3. Record every token emission timestamp for the running streams.
+4. Compare maximum ITL, p99 ITL, and deadline misses during the prefill window.
+5. Repeat at low running batch sizes where speculative decode provides the
+   largest latency benefit.
+
+The primary success criterion is that admitting a long prompt does not destroy
+the running streams' speculative progress or real-time token deadline.
+
+### Ablations
+
+Run these ablations to attribute the result:
+
+- One-token mixed rows versus full verify rows.
+- Eager versus BCG target forward.
+- Eager versus graphed running draft.
+- Eager versus graphed running draft extension.
+- Different high-token capture ladders.
+- Different chain lengths.
+- Shared-expert fusion on and off, where supported.
+- Triton versus alternative small-M MoE kernels.
+
+## Optional kernel work after graph coverage
+
+If verification remains expensive after eliminating launch overhead, optimize
+the small-M FP8 MoE path on Hopper.
+
+The measured verify shapes often contain only 4–32 tokens per expert group.
+Potential work includes:
+
+- A grouped FP8 GEMM schedule specialized for small `M`.
+- Persistent expert-weight tiles across adjacent verify/prefill work.
+- Fusing quantization, routing alignment, activation, and reduction.
+- Reusing prefill routing/expert residency information where correctness
+  permits.
+- Comparing sparse grouped execution with dense-over-active-experts execution.
+
+Do this after graph coverage. The current measurements show that launch and
+orchestration overhead are still present, so a kernel change before graphing
+would confound attribution.
+
+## Compatibility work
+
+The current validation boundary is deliberately narrow. Before production use:
+
+1. Either support or explicitly reject speculative algorithms other than the
+   tested EAGLE/NEXTN V2 path.
+2. Add tree-attention support before allowing `topk > 1`.
+3. Validate non-DSA attention backends.
+4. Validate DP attention and expert parallel all-to-all backends.
+5. Validate pipeline parallelism and multi-node execution.
+6. Validate grammar decoding, logprobs, penalties, and non-greedy sampling.
+7. Validate LoRA, PD disaggregation, hierarchical cache, and deterministic
+   inference.
+8. Define behavior when a mixed shape has no matching graph bucket.
+9. Replace broad batch mutation/restore blocks with typed narrow batch views to
+   reduce state-leak risk.
+10. Decide whether `SGLANG_VIM_DEBUG` remains as an internal diagnostic or is
+    removed before upstreaming.
+
+## Research positioning
+
+The broad idea of verifying speculative tokens in a mixed prefill/decode batch
+has prior art. Megatron Core contains a mixed speculative verification path and
+shape-aware CUDA Graph handling. The contribution here should not be framed as
+the first instance of verify-in-mixed.
+
+The defensible contributions are:
+
+- A verify-in-mixed implementation for SGLang's EAGLE V2 overlap scheduler.
+- The SGLang-specific chain, relay, cache-slot, and dual draft-extension
+  design.
+- Direct per-layer measurement that 85–100% of mixed decode-row experts are
+  already activated by prefill on GLM-5.2.
+- A low-batch, real-time scheduling argument: prefill can provide the expert
+  working set that makes verification cheap even when the decode batch alone
+  is too small.
+
+Related work includes:
+
+- [MoESD](https://arxiv.org/abs/2505.19645), which analyzes expert activation
+  and speculative verification in MoE models.
+- [vLLM PR #9291](https://github.com/vllm-project/vllm/pull/9291), an earlier
+  mixed prefill/speculative-decode effort.
+- [vLLM PR #33652](https://github.com/vllm-project/vllm/pull/33652), which
+  constrains speculative tokens in prefill chunks.
+- [SGLang PR #35300](https://github.com/sgl-project/sglang/pull/35300), a
+  target-only mixed-chunk path for DSpark.
+- SGLang's [Breakable CUDA Graph documentation](/docs/advanced_features/breakable_cuda_graph).
+
+## Definition of done
+
+The work is ready for a production-oriented review when all of the following
+are true:
+
+- Automated tests cover the sequence/KV invariants and mixed-to-decode
+  transition.
+- No correctness or acceptance regression occurs with the feature disabled.
+- Verify-in-mixed acceptance matches sequential verification within expected
+  numerical variation.
+- The 8K mixed target forward hits a prefill BCG bucket.
+- Mixed draft and draft extension use CUDA Graphs for supported shapes.
+- Eager fallback is explicit, counted, and correct for unseen shapes.
+- The same-build sweep shows the expected TTFT/TPOT tradeoff at every tested
+  concurrency.
+- The voice-style benchmark reduces or preserves p99 ITL during prompt
+  admission.
+- Startup time and resident graph memory remain within an agreed budget.
+- Unsupported configurations fail validation instead of silently taking an
+  incorrect path.
+- The exposed experimental flag and debug instrumentation are reviewed for
+  upstream naming and support policy.
