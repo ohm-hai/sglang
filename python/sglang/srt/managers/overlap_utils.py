@@ -95,12 +95,25 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         if batch.mix_running_indices is not None:
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
+            chain_len = int(getattr(batch, "mix_chain_len", 1))
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(
                     decode_gpu,
                     future_map.output_tokens_buf,
                     batch.mix_running_indices,
+                )
+            if chain_len > 1:
+                # verify-in-mixed: each running request occupies chain_len rows.
+                # Row 0 is the committed bonus token; rows 1.. are placeholders
+                # the EAGLE worker overwrites with the drafted chain before the
+                # target forward. Repeat the bonus token across the chain so the
+                # shape is correct and every row holds a valid token id.
+                decode_gpu = (
+                    decode_gpu.unsqueeze(1)
+                    .expand(-1, chain_len)
+                    .reshape(-1)
+                    .contiguous()
                 )
             batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
         else:
@@ -520,6 +533,14 @@ class FutureMap:
 
         fi = draft_input.future_indices
         if fi is None:
+            return
+        # verify-in-mixed: the merged batch's seq_lens covers prefill + running
+        # rows (built by mix_with_running); the running batch's future_indices
+        # only address the running tail. Overwriting seq_lens with the
+        # running-only gather would drop the prefill rows and desync
+        # batch_size from req_pool_indices. mix_with_running already set the
+        # correct merged seq_lens, so skip the relay gather here.
+        if getattr(batch, "mix_chain_len", 1) > 1:
             return
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:

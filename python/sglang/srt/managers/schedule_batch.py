@@ -2402,6 +2402,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
     mix_running_indices_cpu: Optional[torch.Tensor] = None
+    # verify-in-mixed: number of drafted chain tokens carried per running
+    # request in a MIXED batch (1 == legacy 1-token decode degrade). Set by
+    # mix_with_running; consumed by the EAGLE worker to lay out chain rows.
+    mix_chain_len: int = 1
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -3136,9 +3140,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
+    @staticmethod
+    def _verify_in_mixed_enabled() -> bool:
+        """Whether a MIXED batch should carry drafted chains for verification
+        rather than degrading running requests to a 1-token extend. Requires the
+        schedule flag and a chain (topk == 1) speculative algorithm."""
+        try:
+            sched = get_schedule()
+        except Exception:
+            return False
+        return bool(getattr(sched, "enable_verify_in_mixed", False))
+
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+
+        # verify-in-mixed: each running request carries its drafted chain of
+        # `chain_len` tokens as causal extend rows (topk == 1 => the "tree" is a
+        # linear chain, attention-equivalent to a chain_len-token extend). The
+        # target verifies all chain positions in the same mixed forward that
+        # runs the prefill chunk, so verification rides the prefill. The chain
+        # tokens themselves are written at forward entry by the EAGLE worker
+        # (they are not known at schedule time); here we only reserve the rows
+        # and cache slots.
+        chain_len = 1
+        if not self.spec_algorithm.is_none() and self._verify_in_mixed_enabled():
+            chain_len = int(get_spec().speculative_num_draft_tokens or 1)
+        self.mix_chain_len = chain_len
 
         # Same invariant as convert_decode_to_extend: the caller ran
         # prepare_for_decode, so a tail's prefix is its row length - 1.
@@ -3151,7 +3179,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             running_batch.reqs, running_prefix_lens, strict=True
         ):
             req._refresh_fill_ids()
-            req.set_extend_range(prefix_len, prefix_len + 1)
+            req.set_extend_range(prefix_len, prefix_len + chain_len)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
@@ -3159,16 +3187,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
         if not self.spec_algorithm.is_none():
             # Spec keeps no per-step out_cache_loc on the running batch; gather
-            # each tail's bonus slot at the committed length (rebound under overlap).
+            # each tail's slot(s) at the committed length (rebound under overlap).
             tail_base = torch.tensor(
                 [r.seqlen - 1 for r in running_batch.reqs],
                 dtype=torch.int64,
                 device=self.seq_lens.device,
             )
-            running_out_cache_loc = self.req_to_token_pool.req_to_token[
-                running_batch.req_pool_indices.long(),
-                tail_base,
-            ].to(self.out_cache_loc.dtype)
+            if chain_len == 1:
+                running_out_cache_loc = self.req_to_token_pool.req_to_token[
+                    running_batch.req_pool_indices.long(),
+                    tail_base,
+                ].to(self.out_cache_loc.dtype)
+            else:
+                # verify-in-mixed: reserve chain_len contiguous slots per running
+                # request, covering the committed bonus position plus the drafted
+                # chain positions that follow it.
+                chain_offsets = torch.arange(
+                    chain_len, dtype=torch.int64, device=self.seq_lens.device
+                )
+                chain_positions = tail_base.unsqueeze(1) + chain_offsets.unsqueeze(0)
+                running_out_cache_loc = (
+                    self.req_to_token_pool.req_to_token[
+                        running_batch.req_pool_indices.long().unsqueeze(1),
+                        chain_positions,
+                    ]
+                    .reshape(-1)
+                    .to(self.out_cache_loc.dtype)
+                )
             # The spec relay is unresolved at schedule time, so merge_batch
             # would null seq_lens_cpu; rebuild the tails from request state.
             running_seq_lens_cpu = torch.tensor(
@@ -3190,19 +3235,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        # merge_batch only adopts the running batch's spec_info when the prefill
+        # batch already has one (it does not). For spec, the running rows' draft
+        # state (EagleDraftInput) must survive the merge so the EAGLE worker can
+        # draft their chains; adopt it here.
+        if not self.spec_algorithm.is_none() and running_batch.spec_info is not None:
+            self.spec_info = running_batch.spec_info
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
         if tail_base is not None:
             # Spec seq_lens sit at the committed base (bonus token pending);
-            # this step commits it, so tails carry base + 1 or attention drops the row.
+            # this step commits it, so tails carry base + chain_len or attention
+            # drops the row. chain_len == 1 reproduces the legacy 1-token decode.
             merged = self.seq_lens.clone()
-            merged[-running_bs:] = tail_base + 1
+            merged[-running_bs:] = tail_base + chain_len
             self.seq_lens = merged
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens = self.prefix_lens + running_prefix_lens
-        self.extend_lens = self.extend_lens + [1] * running_bs
-        self.extend_num_tokens = self.extend_num_tokens + running_bs
+        self.extend_lens = self.extend_lens + [chain_len] * running_bs
+        self.extend_num_tokens = self.extend_num_tokens + chain_len * running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens = (
             self.extend_logprob_start_lens + [0] * running_bs

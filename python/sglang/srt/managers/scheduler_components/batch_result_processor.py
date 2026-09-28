@@ -295,6 +295,24 @@ class SchedulerBatchResultProcessor:
 
             self._validate_pp_skip_output_comm(batch, result)
 
+            # verify-in-mixed: the running rows at the batch tail each committed
+            # accept_lens[i] tokens (the accepted chain prefix), not 1. Expand the
+            # flat next_token_ids into a per-req list of committed tokens so the
+            # loop below can append the full accepted run per running request.
+            mixed_verify_running_bs = int(getattr(result, "mixed_verify_running_bs", 0))
+            mixed_verify_chain_len = int(getattr(result, "mixed_verify_chain_len", 1))
+            accept_lens_cpu = None
+            if mixed_verify_running_bs > 0:
+                accept_lens_cpu = result.accept_lens.tolist()
+                prefill_bs = len(batch.reqs) - mixed_verify_running_bs
+                per_req_tokens = [[tok] for tok in next_token_ids[:prefill_bs]]
+                tail = next_token_ids[prefill_bs:]
+                for j in range(mixed_verify_running_bs):
+                    start = j * mixed_verify_chain_len
+                    per_req_tokens.append(tail[start : start + accept_lens_cpu[j]])
+            else:
+                per_req_tokens = [[tok] for tok in next_token_ids]
+
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
                 batch,
@@ -303,7 +321,8 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             logprob_pt = 0
 
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            for i, (req, committed_tokens) in enumerate(zip(batch.reqs, per_req_tokens)):
+                next_token_id = committed_tokens[-1]
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
@@ -354,21 +373,25 @@ class SchedulerBatchResultProcessor:
                             req, up_to_tick=batch.forward_iter
                         )
                     else:
-                        # req output_ids are set here
-                        req.output_ids.append(next_token_id)
+                        # req output_ids are set here. verify-in-mixed running rows
+                        # commit the full accepted chain (>= 1 token); prefill rows
+                        # and legacy mixed tails commit exactly 1.
+                        req.output_ids.extend(committed_tokens)
 
                         self._maybe_update_reasoning_tokens(req, next_token_id)
 
                         req.update_finish_state()
-                    # A mixed spec tail committed its pending bonus token; advance
-                    # so the next spec prepare_for_decode reserves from the right base.
+                    # A mixed spec tail committed its pending token(s); advance so
+                    # the next spec prepare_for_decode reserves from the right base.
+                    # verify-in-mixed commits accept_lens tokens; the legacy 1-token
+                    # degrade commits exactly 1.
                     if (
                         not req.finished()
                         and batch.decoding_reqs
                         and req in batch.decoding_reqs
                         and not batch.spec_algorithm.is_none()
                     ):
-                        req.kv.kv_committed_len += 1
+                        req.kv.kv_committed_len += len(committed_tokens)
                     if req.finished():
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)

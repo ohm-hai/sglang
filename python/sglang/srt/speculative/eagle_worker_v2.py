@@ -91,6 +91,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
+    eagle_sample,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -1313,6 +1314,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        # verify-in-mixed: a MIXED batch carrying drafted chains (mix_chain_len > 1)
+        # runs target verification on the chain rows inside the same forward as the
+        # prefill chunk, so verification rides the prefill instead of degrading the
+        # running requests to a 1-token extend.
+        if (
+            batch.forward_mode.is_mixed()
+            and getattr(batch, "mix_chain_len", 1) > 1
+            and self._draft_worker is not None
+        ):
+            return self._forward_mixed_verify(
+                batch,
+                on_publish=on_publish,
+                grammar_barrier=grammar_barrier,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
@@ -1870,6 +1887,411 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 disable_cuda_graph=backup[13],
             )
             dw._rebuild_topk1_chain_buffers()
+
+    def _forward_mixed_verify(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        """verify-in-mixed: run target verification on the drafted chains carried by
+        the running rows of a MIXED batch, in the same forward as the prefill chunk.
+
+        Layout of the merged batch (built by ScheduleBatch.mix_with_running):
+          [ prefill rows (variable extend_len) | running rows (chain_len each) ]
+        The running rows' input_ids were placeholder-filled by
+        resolve_forward_inputs (committed bonus token repeated chain_len times);
+        here we overwrite them with the actual drafted chain, run one mixed target
+        forward, then accept/rollback the chains and seed the draft for both row
+        kinds. chain_len == speculative_num_draft_tokens and topk == 1, so each
+        chain is a linear causal extend.
+        """
+        chain_len = int(batch.mix_chain_len)
+        running_bs = len(batch.decoding_reqs) if batch.decoding_reqs is not None else 0
+        total_bs = batch.seq_lens.shape[0]
+        prefill_bs = total_bs - running_bs
+        device = self.device
+
+        # -- 1. Draft the chain for the running requests ---------------------
+        # batch.spec_info is the running batch's EagleDraftInput (prefill rows
+        # contributed None). draft() sizes its buffers off batch.seq_lens, so
+        # narrow the batch view to the running rows for the duration of the
+        # draft, then restore. The running rows are the tail of the merged batch.
+        self.activate_step_by_batch(running_bs)
+        _saved = (
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.req_pool_indices,
+            batch.reqs,
+            batch.out_cache_loc,
+            batch.input_ids,
+        )
+        batch.seq_lens = batch.seq_lens[prefill_bs:]
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:]
+        else:
+            # MIXED batches leave seq_lens_cpu None; the draft's DSA prefill
+            # metadata path asserts on it, so backfill from the device tensor
+            # (one D2H sync per mixed-verify step -- acceptable at this scale).
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.seq_lens_sum = int(batch.seq_lens.sum())
+        batch.req_pool_indices = batch.req_pool_indices[prefill_bs:]
+        batch.reqs = batch.reqs[prefill_bs:]
+        # The draft reads its input tokens from spec_info (topk_index), not
+        # batch.input_ids; the merged batch's input_ids is the full mixed token
+        # tensor (prefill + chain rows), which would size the draft FB's token
+        # axis wrong. Clear it for the duration of the draft.
+        batch.input_ids = None
+        # The draft CUDA graph is captured for a fixed decode batch size; the
+        # mixed batch's running-row count is dynamic and will not match the
+        # captured buffers. Run the draft eagerly for the mixed-verify path
+        # (draft is ~1.3ms vs ~33ms verify, so eager draft is acceptable). TODO:
+        # token-bucket-keyed draft graphs for mixed shapes (todo #9).
+        _saved_draft_graph = self.draft_worker.cuda_graph_runner
+        self.draft_worker.cuda_graph_runner = None
+        # The draft is a decode-mode forward over the running rows; the merged
+        # batch still carries forward_mode=MIXED, which would route the DSA
+        # backend down the extend path (extend_seq_lens_cpu is None for a
+        # decode draft). Set DECODE for the duration of the draft, then restore.
+        _saved_forward_mode = batch.forward_mode
+        batch.forward_mode = ForwardMode.DECODE
+        # The eager draft mutates forward_batch.input_ids per step (topk=1 ->
+        # 1 token/req) while batch_size stays running_bs, so the EagerRunner's
+        # token-axis registry copy mismatches (input_ids [bs] vs seq_lens [bs]
+        # but out_cache_loc [bs*topk*steps]). Skip the input-copy for the draft
+        # (the draft writes its inputs in place and doesn't need the copy).
+        _saved_no_copy = envs.SGLANG_EAGER_INPUT_NO_COPY.get()
+        envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+        try:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+        finally:
+            envs.SGLANG_EAGER_INPUT_NO_COPY.set(_saved_no_copy)
+            batch.forward_mode = _saved_forward_mode
+            self.draft_worker.cuda_graph_runner = _saved_draft_graph
+            (
+                batch.seq_lens,
+                batch.seq_lens_cpu,
+                batch.seq_lens_sum,
+                batch.req_pool_indices,
+                batch.reqs,
+                batch.out_cache_loc,
+                batch.input_ids,
+            ) = _saved
+        assert verify_input.is_verify_input()
+
+        # -- 2. Write the drafted chain into the running rows' input_ids -----
+        # verify_input.draft_token is [running_bs * chain_len] laid out
+        # request-major, matching the running rows' order at the batch tail.
+        prefill_tokens = batch.input_ids[: batch.input_ids.numel() - running_bs * chain_len]
+        batch.input_ids = torch.cat([prefill_tokens, verify_input.draft_token])
+
+        # The running batch's spec_info carries a draft-shaped `positions`
+        # (repeat_interleave(topk=1) -> running_bs tokens). ForwardBatch.init_new
+        # would adopt it and skip compute_position for the full mixed token
+        # count. Clear it so the mixed extend recomputes positions for all
+        # prefill + chain tokens.
+        if batch.spec_info is not None and getattr(batch.spec_info, "positions", None) is not None:
+            batch.spec_info.positions = None
+
+        # -- 3. One mixed target forward over prefill + chain rows -----------
+        # Capture FULL hidden states so we can score every chain position (the
+        # EXTEND logits path alone would only give last-position-per-row).
+        target_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch_output = self.target_worker.forward_batch_generation(
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=target_capture_mode,
+        )
+
+        # -- 4. Split logits: prefill last-position vs chain all-position ----
+        logits_output = batch_output.logits_output
+        # next_token_logits from the EXTEND path is last-position-per-row:
+        # [total_bs, vocab]. The first prefill_bs rows are the prefill requests'
+        # sampled tokens; the running rows' last-position logits are NOT the
+        # verify logits (those need every chain position), so we recompute them
+        # from the FULL hidden states below.
+        prefill_next_token_ids = batch_output.next_token_ids[:prefill_bs]
+
+        # All-position hidden states: [total_tokens, hidden].
+        full_hidden = logits_output.hidden_states
+        # Chain rows occupy the tail running_bs * chain_len token positions.
+        chain_hidden = full_hidden[full_hidden.shape[0] - running_bs * chain_len :]
+
+        # Score every chain position with the lm_head to get verify logits
+        # [running_bs * chain_len, vocab]. Build a minimal TARGET_VERIFY
+        # LogitsMetadata so the TP/DP gather + buffer-copy paths in _get_logits
+        # behave exactly as they do for a normal verify forward.
+        from sglang.srt.layers.logits_processor import LogitsMetadata
+
+        lp = self.target_worker.model_runner.model.logits_processor
+        chain_logits_metadata = LogitsMetadata(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        chain_logits = lp._get_logits(
+            chain_hidden,
+            self.target_worker.model_runner.model.lm_head,
+            chain_logits_metadata,
+            use_logits_buffer=False,
+        )
+
+        # -- 5. Accept / rollback on the chains ------------------------------
+        # Build a verify-scoped logits output and run eagle_sample over the
+        # running requests. We temporarily narrow batch.seq_lens to the running
+        # rows so bs == running_bs inside eagle_sample.
+        verify_logits_output = type(logits_output)(
+            next_token_logits=chain_logits,
+            hidden_states=chain_hidden,
+        )
+        saved_seq_lens = batch.seq_lens
+        saved_forward_mode = batch.forward_mode
+        batch.seq_lens = batch.seq_lens[prefill_bs:]
+        # eagle_sample gates on is_idle(); MIXED is not idle, so it takes the
+        # real path. It reads batch.sampling_info (shared) and verify_input.
+        predict, accept_lens, accept_index = eagle_sample(
+            verify_input,
+            batch,
+            verify_logits_output,
+            None,
+        )
+        batch.seq_lens = saved_seq_lens
+        batch.forward_mode = saved_forward_mode
+
+        # Roll back KV for rejected chain suffixes and commit accepted length.
+        new_running_seq_lens = batch.seq_lens[prefill_bs:] + accept_lens
+
+        # -- 6. Assemble the result ------------------------------------------
+        # next_token_ids layout for the output processor:
+        #   [ prefill rows: 1 sampled token each | running rows: chain_len predict each ]
+        # The running rows' committed tokens are predict[i*chain_len : i*chain_len +
+        # accept_lens[i]] (the accepted chain prefix incl. the bonus token). We emit
+        # the full per-row predict and let the output processor slice by accept_lens.
+        batch_output.next_token_ids = torch.cat(
+            [prefill_next_token_ids.to(torch.int64), predict.to(torch.int64)]
+        )
+        batch_output.accept_lens = accept_lens
+        batch_output.accept_index = accept_index
+        # Mark this as a verify-in-mixed result so the output processor commits
+        # accept_lens tokens (not 1) for each running row.
+        batch_output.mixed_verify_running_bs = running_bs
+        batch_output.mixed_verify_chain_len = chain_len
+
+        # Spec_v2 convention: new_seq_lens = length BEFORE this iter's tokens for
+        # prefill rows; running rows advance by accept_lens.
+        new_seq_lens = batch.seq_lens.clone()
+        new_seq_lens[prefill_bs:] = new_running_seq_lens
+        batch_output.new_seq_lens = new_seq_lens
+
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        # -- 7. Seed the draft for both row kinds ----------------------------
+        # Two draft_extend passes, each on a narrowed view of the batch, then a
+        # merge of the two EagleDraftInputs (prefill rows first, then running).
+        #  - prefill rows: _draft_extend_for_prefill seeds the draft from the
+        #    prompt end (full row is new).
+        #  - running rows: _draft_extend_for_decode seeds from the accepted chain,
+        #    using accept_lens to select the last accepted hidden state and to
+        #    fill only the committed draft KV.
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group,
+                owns_attention=self.draft_worker.draft_owns_attention,
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            next_draft_input = self._mixed_draft_extend(
+                batch,
+                prefill_bs=prefill_bs,
+                running_bs=running_bs,
+                chain_len=chain_len,
+                full_hidden=full_hidden,
+                prefill_next_token_ids=prefill_next_token_ids,
+                predict=predict,
+                accept_lens=accept_lens,
+                batch_output=batch_output,
+                mm_input_embeds=logits_output.mm_input_embeds,
+            )
+        batch_output.next_draft_input = next_draft_input
+
+        return batch_output
+
+    def _mixed_draft_extend(
+        self,
+        batch: ScheduleBatch,
+        *,
+        prefill_bs: int,
+        running_bs: int,
+        chain_len: int,
+        full_hidden: torch.Tensor,
+        prefill_next_token_ids: torch.Tensor,
+        predict: torch.Tensor,
+        accept_lens: torch.Tensor,
+        batch_output: GenerationBatchResult,
+        mm_input_embeds: Optional[torch.Tensor],
+    ) -> "EagleDraftInput":
+        """Run draft_extend for the prefill and running row groups and merge the
+        resulting draft inputs (prefill rows first, then running rows)."""
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        prefill_draft_input = None
+        running_draft_input = None
+
+        # --- running rows: decode-style draft extend ---
+        # Narrow the batch to the running rows and build a verify-shaped
+        # batch_result (accept_lens / predict / hidden) for _draft_extend_for_decode.
+        if running_bs > 0:
+            chain_hidden = full_hidden[full_hidden.shape[0] - running_bs * chain_len :]
+            # bonus token per running request = last accepted chain token.
+            accept_lens_i64 = accept_lens.to(torch.int64)
+            last_accepted = (
+                torch.arange(running_bs, device=predict.device) * chain_len
+                + accept_lens_i64
+                - 1
+            )
+            bonus_tokens = predict[last_accepted].to(torch.int32)
+            running_result = GenerationBatchResult(
+                logits_output=type(batch_output.logits_output)(
+                    next_token_logits=None,
+                    hidden_states=chain_hidden,
+                ),
+                next_token_ids=predict.to(torch.int64),
+                accept_lens=accept_lens,
+                next_draft_input=EagleDraftInput(bonus_tokens=bonus_tokens),
+            )
+            _saved = self._narrow_batch_to_tail(batch, prefill_bs, chain_len)
+            # Draft-extend CUDA graph is also captured for fixed decode shapes;
+            # run eagerly for the dynamic mixed running-row count.
+            _saved_de_graph = self.draft_worker.cuda_graph_runner_for_draft_extend
+            self.draft_worker.cuda_graph_runner_for_draft_extend = None
+            try:
+                self.draft_worker._draft_extend_for_decode(batch, running_result)
+            finally:
+                self.draft_worker.cuda_graph_runner_for_draft_extend = _saved_de_graph
+                self._restore_batch(batch, _saved)
+            running_draft_input = running_result.next_draft_input
+
+        # --- prefill rows: prefill-style draft extend ---
+        if prefill_bs > 0:
+            prefill_hidden = full_hidden[: full_hidden.shape[0] - running_bs * chain_len]
+            _saved = self._narrow_batch_to_head(batch, prefill_bs)
+            try:
+                prefill_draft_input = self.draft_worker._draft_extend_for_prefill(
+                    batch,
+                    prefill_hidden,
+                    prefill_next_token_ids,
+                    mm_input_embeds,
+                )
+            finally:
+                self._restore_batch(batch, _saved)
+
+        # --- merge: prefill rows first, then running rows ---
+        if prefill_draft_input is None:
+            return running_draft_input
+        if running_draft_input is None:
+            return prefill_draft_input
+        prefill_draft_input.merge_batch(running_draft_input)
+        return prefill_draft_input
+
+    @staticmethod
+    def _narrow_batch_to_tail(batch: ScheduleBatch, prefill_bs: int, chain_len: int = 1):
+        """Temporarily restrict a mixed batch to its running (tail) rows. Returns a
+        restore token for _restore_batch. The running rows occupy the tail
+        running_bs * chain_len token slots of out_cache_loc (the chain rows)."""
+        saved = (
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.req_pool_indices,
+            batch.reqs,
+            batch.out_cache_loc,
+            batch.input_ids,
+            batch.extend_lens,
+            batch.prefix_lens,
+            batch.extend_num_tokens,
+        )
+        running_bs = len(batch.reqs) - prefill_bs
+        batch.seq_lens = batch.seq_lens[prefill_bs:]
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu = batch.seq_lens_cpu[prefill_bs:]
+        else:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.seq_lens_sum = int(batch.seq_lens.sum())
+        batch.req_pool_indices = batch.req_pool_indices[prefill_bs:]
+        batch.reqs = batch.reqs[prefill_bs:]
+        # The running rows' draft-extend writes into the chain slots, which are
+        # the tail running_bs * chain_len entries of the mixed out_cache_loc.
+        if batch.out_cache_loc is not None and chain_len > 1:
+            batch.out_cache_loc = batch.out_cache_loc[
+                batch.out_cache_loc.numel() - running_bs * chain_len :
+            ]
+        return saved
+
+    @staticmethod
+    def _narrow_batch_to_head(batch: ScheduleBatch, prefill_bs: int):
+        """Temporarily restrict a mixed batch to its prefill (head) rows."""
+        saved = (
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.req_pool_indices,
+            batch.reqs,
+            batch.out_cache_loc,
+            batch.input_ids,
+            batch.extend_lens,
+            batch.prefix_lens,
+            batch.extend_num_tokens,
+        )
+        batch.seq_lens = batch.seq_lens[:prefill_bs]
+        batch.seq_lens_cpu = (
+            batch.seq_lens_cpu[:prefill_bs] if batch.seq_lens_cpu is not None else None
+        )
+        batch.seq_lens_sum = int(batch.seq_lens.sum())
+        batch.req_pool_indices = batch.req_pool_indices[:prefill_bs]
+        batch.reqs = batch.reqs[:prefill_bs]
+        # Prefill rows' input_ids are the head tokens (their extend_len sum).
+        head_tokens = int(sum(batch.extend_lens[:prefill_bs]))
+        batch.input_ids = batch.input_ids[:head_tokens]
+        # Prefill rows' out_cache_loc are the head tokens too (the running
+        # rows' chain slots are the tail).
+        if batch.out_cache_loc is not None:
+            batch.out_cache_loc = batch.out_cache_loc[:head_tokens]
+        batch.extend_lens = batch.extend_lens[:prefill_bs]
+        batch.prefix_lens = batch.prefix_lens[:prefill_bs]
+        batch.extend_num_tokens = head_tokens
+        return saved
+
+    @staticmethod
+    def _restore_batch(batch: ScheduleBatch, saved) -> None:
+        (
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.req_pool_indices,
+            batch.reqs,
+            batch.out_cache_loc,
+            batch.input_ids,
+            batch.extend_lens,
+            batch.prefix_lens,
+            batch.extend_num_tokens,
+        ) = saved
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
         return run_eagle_verify(

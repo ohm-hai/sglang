@@ -203,6 +203,15 @@ class Schedule(msgspec.Struct):
         bool,
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
     ] = False
+    enable_verify_in_mixed: A[
+        bool,
+        "When mixing prefill and decode (enable_mixed_chunk) with EAGLE-style "
+        "speculative decoding, carry each running decode request's drafted token "
+        "chain as causal extend rows inside the mixed batch and run target "
+        "verification on them, instead of degrading decode rows to a 1-token "
+        "extend. Lets verification ride the prefill chunk. Requires "
+        "enable_mixed_chunk and a chain (topk=1) speculative algorithm.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

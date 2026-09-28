@@ -154,6 +154,19 @@ def check_server_args(server_args: Any):
             f"speculative_algorithm={cfg.speculative_algorithm}"
         )
 
+        # verify-in-mixed rides the prefill chunk with the drafted chain as
+        # causal extend rows; only a linear chain (topk == 1) is attention-
+        # equivalent to an extend, so tree drafting (topk > 1) is rejected.
+        if cfg.enable_verify_in_mixed:
+            assert cfg.enable_mixed_chunk, (
+                "enable_verify_in_mixed requires enable_mixed_chunk"
+            )
+            topk = cfg.speculative_eagle_topk
+            assert topk is None or int(topk) == 1, (
+                "enable_verify_in_mixed only supports chain speculative decoding "
+                f"(speculative_eagle_topk == 1); got topk={topk}"
+            )
+
     # Check chunked prefill
     # Skip validation if chunked prefill is disabled (i.e., size <= 0).
     # Skip validation if disaggregation mode is decode.

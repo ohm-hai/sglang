@@ -91,6 +91,15 @@ class GenerationBatchResult:
     grammar_retained_tokens: Optional[list] = None
 
     # FIXME(lsyin): maybe move to a better place?
+    # verify-in-mixed: a MIXED batch that ran target verification on its running
+    # rows. mixed_verify_running_bs is the count of running (decode) rows at the
+    # batch tail; mixed_verify_chain_len is the per-row drafted-chain width. When
+    # mixed_verify_running_bs > 0 the output processor commits accept_lens tokens
+    # (not 1) for each running row, reading them from the chain_len-wide tail of
+    # next_token_ids.
+    mixed_verify_running_bs: int = 0
+    mixed_verify_chain_len: int = 1
+
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
 

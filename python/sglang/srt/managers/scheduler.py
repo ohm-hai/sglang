@@ -1327,6 +1327,14 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        # Verify-in-mixed: carry drafted chains as extend rows in the mixed batch
+        # and run target verification on them. Only valid for chain (topk=1)
+        # EAGLE-style spec; requires mixed chunk to be active.
+        self.enable_verify_in_mixed = (
+            self.is_mixed_chunk
+            and get_schedule().enable_verify_in_mixed
+            and not self.spec_algorithm.is_none()
+        )
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
